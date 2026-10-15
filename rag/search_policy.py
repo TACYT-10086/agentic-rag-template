@@ -1,10 +1,12 @@
-"""search_policy 工具：Agentic Query-Transformed RAG 的检索入口。
+"""search_policy tool: entry point for Agentic Query-Transformed RAG retrieval.
 
-流程 —— 模型自己选查询改写策略 → 检索 → 对结果打分 → 判不相关就换一个策略重试，
-**总共最多 2 轮**；两轮都不相关则返回「较好的一轮」。
+Flow: the model picks a query-rewrite strategy on its own -> retrieves -> scores the
+results -> if judged irrelevant, swaps to another strategy and retries, for **at most
+2 rounds**; if both rounds are irrelevant, the "better round" is returned.
 
-CLAUDE.md 的硬性要求：工具执行前必须自己校验权限，绝不依赖模型判断。
-所以 search_policy() 的第一行就是 check_permission(role)，在任何检索 / LLM 调用之前。
+Hard requirement from CLAUDE.md: the tool must validate permissions itself before
+executing, and must never rely on the model's judgment. Hence the first line of
+search_policy() is check_permission(role), before any retrieval / LLM call.
 """
 
 from rag.retriever import grade_documents, retrieve_many
@@ -19,32 +21,39 @@ from llm import chat_json
 
 TOOL_NAME = "search_policy"
 
-# role 由会话层（已认证的身份）注入，不放进工具的模型可见参数里 ——
-# 否则就成了「让模型自己声明我是谁」，等于没有权限校验。
+# The role is injected by the session layer (an authenticated identity) and is kept out
+# of the model-visible parameters of the tool -- otherwise it would amount to "letting
+# the model declare who I am", which is no permission check at all.
 ALLOWED_ROLES = frozenset({"member", "coach", "admin"})
 
 MAX_ROUNDS = 2
 
 _SELECT_SYSTEM = (
-    "你是检索策略调度器。根据用户问题的特点，从给定策略里挑一个最合适的。用 json 返回。"
+    "You are the retrieval strategy scheduler. Based on the characteristics of the "
+    "user's question, pick the most suitable strategy from the given ones. "
+    "Return it as json."
 )
 
 
 def check_permission(role: str) -> None:
-    """执行前的权限校验。不通过就抛 PermissionError，不做任何后续动作。
+    """Validate permissions before execution. Raise a PermissionError otherwise,
+    performing no further action.
 
-    这是工具的第一道门：没过门之前不选策略、不检索、不调用 LLM。
+    This is the tool's first gate: no strategy selection, retrieval, or LLM call
+    happens before passing through it.
     """
     if not role or role not in ALLOWED_ROLES:
         raise PermissionError(
-            f"{TOOL_NAME} 拒绝执行：角色 {role!r} 不在允许列表 {sorted(ALLOWED_ROLES)} 内"
+            f"{TOOL_NAME} refused to run: role {role!r} is not in the allowed list "
+            f"{sorted(ALLOWED_ROLES)}"
         )
 
 
 def _choose_strategy(question: str) -> str:
-    """让模型从注册表里挑一个策略，返回经 resolve_strategy 校验过的规范名。"""
+    """Ask the model to pick a strategy from the registry and return the canonical name
+    validated by resolve_strategy."""
     options = "\n".join(
-        f"- {name}：{STRATEGY_DESCRIPTIONS.get(name, '')}" for name in available_strategies()
+        f"- {name}: {STRATEGY_DESCRIPTIONS.get(name, '')}" for name in available_strategies()
     )
 
     data = chat_json(
@@ -53,23 +62,25 @@ def _choose_strategy(question: str) -> str:
             {
                 "role": "user",
                 "content": (
-                    f"可选策略：\n{options}\n\n"
-                    f"用户问题：{question}\n\n"
-                    "请选一个策略，用 json 返回。"
+                    f"Available strategies:\n{options}\n\n"
+                    f"User question: {question}\n\n"
+                    "Pick one strategy and return it as json."
                 ),
             },
         ],
-        schema_hint='{"strategy": "rewrite", "reason": "为什么选它"}',
+        schema_hint='{"strategy": "rewrite", "reason": "why it was chosen"}',
     )
 
-    # 模型可能拼错或胡诌，resolve_strategy 兜底回落默认策略
+    # The model may misspell or make things up; resolve_strategy falls back to the
+    # default strategy as a safety net
     return resolve_strategy(data.get("strategy"))
 
 
 def _different_strategy(current: str) -> str:
-    """返回一个与 current 不同的策略。
+    """Return a strategy different from current.
 
-    确定性轮转，不再花一次 LLM 调用 —— 「换一个策略」没什么可决策的。
+    Deterministic rotation, no extra LLM call -- "try another strategy" requires no
+    decision-making.
     """
     names = available_strategies()
     current = resolve_strategy(current)
@@ -80,7 +91,8 @@ def _different_strategy(current: str) -> str:
 
 
 def _fuse(results: list[list[dict]]) -> list[dict]:
-    """多路召回合并：按 id 去重，同一文档取最高分，最后按分数降序。"""
+    """Merge multi-way recall: deduplicate by id, keep the highest score per document,
+    and finally sort in descending score order."""
     best: dict[int, dict] = {}
     for hits in results:
         for doc in hits:
@@ -92,7 +104,8 @@ def _fuse(results: list[list[dict]]) -> list[dict]:
 
 
 def _pick_best(rounds: list[dict]) -> dict:
-    """两轮都不相关时挑「较好的一轮」：先比相关文档数，再比最高相似度。"""
+    """When both rounds are irrelevant, pick the "better round": first compare the
+    number of relevant documents, then the highest similarity."""
 
     def score(round_: dict) -> tuple[int, float]:
         top = max((d.get("score", 0.0) for d in round_["docs"]), default=0.0)
@@ -108,16 +121,18 @@ def search_policy(
     top_k: int = 3,
     strategy: str | None = None,
 ) -> dict:
-    """Agentic 检索：选策略 → 检索 → 评分 → 不相关就换策略重试（最多 2 轮）。
+    """Agentic retrieval: pick a strategy -> retrieve -> grade -> if irrelevant, retry
+    with another strategy (at most 2 rounds).
 
-    strategy 显式传入时跳过「让模型选策略」这一步，供测试与批量评测省调用、保可复现。
+    When strategy is passed explicitly, the "let the model pick a strategy" step is
+    skipped, which saves calls and keeps tests / batch eval reproducible.
 
-    返回:
+    Returns:
       {"question", "role", "strategy_used", "sufficient",
-       "docs": [最终 top_k 条],                       # 元素结构与 retrieve() 一致
+       "docs": [final top_k items],                   # element structure matches retrieve()
        "rounds": [{"strategy", "queries", "docs", "grade"}, ...]}
     """
-    # 第一行，先于一切检索与 LLM 调用
+    # First line, before every retrieval and LLM call
     check_permission(role)
 
     question = (question or "").strip()

@@ -1,11 +1,15 @@
-"""查询改写：把用户原问题加工成更好检索的查询串。
+"""Query rewriting: turns the user's original question into queries that are easier to
+retrieve.
 
-三种策略统一契约 —— `(question) -> list[str]`，返回「待编码的查询串」而不是检索结果。
-这样上层循环和评测不用按策略分支，一律拿到字符串列表交给 retriever 编码即可。
-HyDE 生成的假想文档正文也走同一条路：它本身就是一段「像答案的文本」。
+All three strategies share one contract: `(question) -> list[str]`, returning the
+"queries to embed" rather than retrieval results. This way the upper-loop and the eval
+don't need to branch per strategy -- they always get a list of strings to hand to the
+retriever for encoding. The HyDE-generated hypothetical document body also goes through
+the same path: it is itself a "piece of text that looks like an answer".
 
-注意语料入库时编码的是 `标题\\n正文`（见 rag/ingest.py），而检索时编码的是裸查询串。
-假想文档比短问题更贴近索引侧，这正是 HyDE 起效的原因。
+Note that at ingestion the corpus is indexed as `title\\nbody` (see rag/ingest.py),
+while at retrieval time we encode the bare query string. A hypothetical document is
+closer to the index side than a short question, which is exactly why HyDE works.
 """
 
 from collections.abc import Callable
@@ -14,32 +18,40 @@ from llm import chat, chat_json
 
 DEFAULT_STRATEGY = "rewrite"
 
-# 给「让模型自己选策略」的 prompt 用：策略名 -> 一句话说明 + 适用场景
+# For the "let the model pick a strategy" prompt: strategy name -> one-line description +
+# applicable scenario
 STRATEGY_DESCRIPTIONS: dict[str, str] = {
-    "rewrite": "把口语化问题改写成一句检索友好的书面查询。适合表述与场馆手册用词接近的问题。",
-    "multi_query": "生成多条语义相同但用词不同的查询并合并结果。适合表述模糊、一词多义的问题。",
-    "hyde": "先写一段假想的答案文档，再用它去检索。适合答案措辞与问题差异大、很口语化的问题。",
+    "rewrite": "Rewrite a colloquial question into a retrieval-friendly, written query. "
+               "Best for questions whose wording is close to the venue handbook.",
+    "multi_query": "Generate several queries with the same meaning but different wording "
+                   "and merge the results. Best for vague, polysemous questions.",
+    "hyde": "First write a hypothetical answer document, then use it to retrieve. Best "
+            "for questions whose answer wording differs a lot and is very colloquial.",
 }
 
 _REWRITE_SYSTEM = (
-    "你是检索查询改写器。把用户的口语化问题改写成一句简洁、书面、"
-    "便于向量检索的查询，只输出改写后的查询本身，不要解释、不要加引号。"
+    "You are a retrieval query rewriter. Rewrite the user's colloquial question into "
+    "a concise, formal, vector-search-friendly query. Output only the rewritten query "
+    "itself, with no explanation and no quotation marks."
 )
 
 _HYDE_SYSTEM = (
-    "你是健身场馆的知识库写手。针对用户的问题，写一段 150-250 字的说明文字，"
-    "风格模仿场馆手册，直接给出可能成立的答案细节（如时间、金额、规则）。"
-    "不要用 markdown，不要复述问题，只输出正文。"
+    "You are the knowledge-base writer for a fitness venue. For the user's question, "
+    "write a 150-250 character explanation in the style of the venue handbook, giving "
+    "the answer details that likely hold (such as times, prices, rules). Do not use "
+    "markdown, do not restate the question, output only the body text."
 )
 
 _MULTI_SYSTEM = (
-    "你是检索查询扩写器。针对用户的问题，生成多条语义相同但用词和角度不同的检索查询，"
-    "覆盖同义词、书面表达和可能的专业术语。"
+    "You are a retrieval query expander. For the user's question, generate several "
+    "retrieval queries with the same meaning but different wording and angles, "
+    "covering synonyms, formal expressions, and possible technical terms."
 )
 
 
 def rewrite_query(question: str) -> list[str]:
-    """把问题改写成一句检索友好的书面查询。返回长度 1 的列表。"""
+    """Rewrite the question into a retrieval-friendly written query. Returns a list of
+    length 1."""
     text = chat(
         [
             {"role": "system", "content": _REWRITE_SYSTEM},
@@ -47,24 +59,28 @@ def rewrite_query(question: str) -> list[str]:
         ]
     ).strip()
 
-    # 模型偶尔会输出空串（DeepSeek 已知问题），退回原问题至少让检索能跑
+    # The model occasionally emits an empty string (a known DeepSeek issue); falling
+    # back to the original question at least keeps retrieval running
     return [text] if text else [question]
 
 
 def multi_query(question: str, n: int = 3) -> list[str]:
-    """生成 n 条同义异构的查询。保序去重，模型给不出东西时退回 [原问题]。"""
+    """Generate n synonymous-but-differently-worded queries. Deduplicate in order, and
+    fall back to [original question] when the model produces nothing."""
     data = chat_json(
         [
             {"role": "system", "content": _MULTI_SYSTEM},
             {
                 "role": "user",
-                "content": f"问题：{question}\n请生成 {n} 条查询，用 json 返回。",
+                "content": f"Question: {question}\nPlease generate {n} queries and "
+                           f"return them as json.",
             },
         ],
-        schema_hint='{"queries": ["查询一", "查询二", "查询三"]}',
+        schema_hint='{"queries": ["query 1", "query 2", "query 3"]}',
     )
 
-    # 用 json 而不是自由文本，就是看中这里是变长列表——纯文本解析太脆
+    # Json is used instead of free text because this is a variable-length list --
+    # plain-text parsing would be too fragile
     raw = data.get("queries") or []
 
     seen: set[str] = set()
@@ -79,7 +95,7 @@ def multi_query(question: str, n: int = 3) -> list[str]:
 
 
 def hyde(question: str) -> list[str]:
-    """生成一段假想答案文档，返回 [正文]（长度 1）。"""
+    """Generate a hypothetical answer document, returning [body] (length 1)."""
     text = chat(
         [
             {"role": "system", "content": _HYDE_SYSTEM},
@@ -96,31 +112,34 @@ STRATEGIES: dict[str, Callable[[str], list[str]]] = {
     "hyde": hyde,
 }
 
-# 名字归一化用：去掉大小写、空格、连字符、下划线后的映射。
-# "HyDE" / "multi-query" / "multi query" 都该落到同一个策略上。
+# For name normalization: mapping built after removing case, spaces, hyphens and
+# underscores. "HyDE" / "multi-query" / "multi query" should all map to the same strategy.
 _NORMALIZED = {
     "".join(ch for ch in name.lower() if ch.isalnum()): name for name in STRATEGIES
 }
 
 
 def available_strategies() -> list[str]:
-    """可用策略名，顺序稳定（dict 保序），供选策略 prompt 和「换一个策略」使用。"""
+    """Available strategy names, in stable order (dict preserves insertion order), for
+    the strategy-picking prompt and for "try another strategy"."""
     return list(STRATEGIES)
 
 
 def resolve_strategy(name: str | None) -> str:
-    """把模型给的名字映射到注册表里的规范名。
+    """Map the name given by the model to the canonical name in the registry.
 
-    未知、拼错或空值一律回落 DEFAULT_STRATEGY —— 模型写错策略名绝不能弄崩循环。
+    Unknown, misspelled or empty values all fall back to DEFAULT_STRATEGY -- a wrong
+    strategy name from the model must never break the loop.
     """
     key = "".join(ch for ch in (name or "").lower() if ch.isalnum())
     return _NORMALIZED.get(key, DEFAULT_STRATEGY)
 
 
 def transform(question: str, strategy: str) -> list[str]:
-    """策略名 -> 待编码的查询串列表。
+    """Strategy name -> list of queries to encode.
 
-    策略产出为空时退回 [原问题]，保证调用方永远拿到至少一条可检索的串。
+    Falls back to [original question] when the strategy produces nothing, so the caller
+    always gets at least one searchable query.
     """
     question = (question or "").strip()
     queries = STRATEGIES[resolve_strategy(strategy)](question)
